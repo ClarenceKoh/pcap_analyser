@@ -28,6 +28,7 @@ This tool is currently configured for **Windows** environments.
 Ensure you have a fields.txt file in the same directory as the script. This file dictates exactly what data tshark will extract.
 
 *Example fields.txt:*
+
 frame.time_epoch
 eth.src
 eth.dst
@@ -39,7 +40,7 @@ ip.len
 Run the script from the command line, providing the target PCAP file using the -i flag.
 
 *Basic Analysis:*
-python pcap_analyzer.py -i incident_capture.pcap
+python pcap_analyzer.py -i /pcap-captures/incident_capture.pcap
 
 *Advanced Usage (Custom Config & Output Name):*
 python pcap_analyzer.py -i incident_capture.pcap -c custom_fields.txt -o Client_Report_Q3.xlsx
@@ -52,8 +53,11 @@ Command Line Arguments
 
 ## 📊 Understanding the Output
 The tool generates three primary artifacts:
+
 **Raw_Traffic_Data.csv:** The fully cleaned, merged, and flattened dataset containing every parsed packet. Useful for manual grep searching or ingesting into a SIEM.
+
 **/quarantine/ Directory:** Contains any files carved from the network traffic, safely renamed to <SHA256-hash>.bin.
+
 **Traffic_Summaries.xlsx:** A multi-tabbed Excel report designed for client presentations and quick analyst review.
 
 *    **🚨 Suspected Beacons:** Hosts exhibiting strict, repetitive timing intervals.
