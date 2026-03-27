@@ -34,20 +34,6 @@ eth.dst
 ip.src
 ip.dst
 ip.len
-tcp.srcport
-udp.srcport
-tcp.dstport
-udp.dstport
-_ws.col.Protocol
-http.host
-tls.handshake.extensions_server_name
-dns.qry.name
-dns.flags.rcode
-tcp.flags.syn
-tcp.flags.ack
-tcp.flags.reset
-tls.handshake.ja3
-_ws.col.Info
 
 ## 💻 Usage
 Run the script from the command line, providing the target PCAP file using the -i flag.
