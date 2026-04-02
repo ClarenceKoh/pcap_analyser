@@ -103,7 +103,7 @@ def process_chunk_task(chunk_file, temp_csv, fields):
 def generate_incident_summary(df):
     """Analyzes the network traffic for malicious behavior safely."""
     print("[*] Running Threat Hunting heuristics...")
-    dns_anomalies, beacons, ja3_stats = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    dns_anomalies, beacons, ja3_stats, cleartext_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     
     if 'dns.flags.rcode' in df.columns and 'Src IP' in df.columns:
         nxdomains = df[df['dns.flags.rcode'].astype(str).str.contains('3', na=False)]
@@ -126,18 +126,28 @@ def generate_incident_summary(df):
             (beacon_stats['Mean_Interval'] > 5.0)
         ].sort_values(by='Packet_Count', ascending=False)
         
-    # --- FEATURE 2: JA3 FINGERPRINTING ---
     if 'tls.handshake.ja3' in df.columns:
-        # Filter out empty JA3 strings, group them, and count
         ja3_data = df.dropna(subset=['tls.handshake.ja3'])
         if not ja3_data.empty:
             ja3_stats = ja3_data.groupby(['Src IP', 'tls.handshake.ja3']).size().reset_index(name='Occurrences')
             ja3_stats = ja3_stats.sort_values(by='Occurrences', ascending=False)
+
+    # --- FEATURE B: CLEARTEXT VULNERABILITIES ---
+    if 'Dst Port' in df.columns:
+        # Ensure ports are treated as numbers, not strings
+        df['Dst Port_Num'] = pd.to_numeric(df['Dst Port'], errors='coerce')
+        # Filter for FTP (21), Telnet (23), HTTP (80)
+        cleartext_traffic = df[df['Dst Port_Num'].isin([21, 23, 80])]
+        
+        if not cleartext_traffic.empty:
+            cleartext_df = cleartext_traffic.groupby(['Src IP', 'Dst IP', 'Dst Port_Num', 'Protocol']).size().reset_index(name='Connection Count')
+            cleartext_df = cleartext_df.sort_values(by='Connection Count', ascending=False)
+            cleartext_df.rename(columns={'Dst Port_Num': 'Port'}, inplace=True)
             
-    return dns_anomalies, beacons, ja3_stats
+    # Notice we now return 4 items!
+    return dns_anomalies, beacons, ja3_stats, cleartext_df
 
-
-def process_and_split_data(raw_dataframe, final_csv_path, summary_excel_path, carved_files_df):
+def process_and_split_data(raw_dataframe, final_csv_path, summary_excel_path, carved_files_df, pcap_filename):
     """Cleans the massive combined DataFrame and generates reports."""
     print("[*] Loading and cleaning combined data with Pandas...")
     df = raw_dataframe
@@ -151,6 +161,10 @@ def process_and_split_data(raw_dataframe, final_csv_path, summary_excel_path, ca
     if 'http.host' in df.columns and 'tls.handshake.extensions_server_name' in df.columns:
         df['Host'] = df['http.host'].fillna(df['tls.handshake.extensions_server_name'])
         
+    # Ensure ip.len is numeric so we can do math on it later
+    if 'ip.len' in df.columns:
+        df['ip.len'] = pd.to_numeric(df['ip.len'], errors='coerce').fillna(0)
+        
     rename_map = {
         'ip.src': 'Src IP', 'ip.dst': 'Dst IP',
         'eth.src': 'Src MAC', 'eth.dst': 'Dst MAC',
@@ -158,7 +172,8 @@ def process_and_split_data(raw_dataframe, final_csv_path, summary_excel_path, ca
     }
     df = df.rename(columns=rename_map)
     
-    dns_anomalies, beacons, ja3_stats = generate_incident_summary(df)
+    # Unpack the 4 dataframes from our updated heuristics function
+    dns_anomalies, beacons, ja3_stats, cleartext_df = generate_incident_summary(df)
     
     print(f"[*] Saving raw data to {final_csv_path}...")
     df.to_csv(final_csv_path, index=False)
@@ -166,10 +181,47 @@ def process_and_split_data(raw_dataframe, final_csv_path, summary_excel_path, ca
     print(f"[*] Generating summaries to {summary_excel_path}...")
     with pd.ExcelWriter(summary_excel_path, engine='openpyxl') as writer:
         
-        # Incident Summary Tabs
+        # --- FEATURE A: EXECUTIVE OVERVIEW DASHBOARD ---
+        # Calculate Capture Duration
+        capture_duration = df['Time'].max() - df['Time'].min() if 'Time' in df.columns else "Unknown"
+        
+        overview_data = {
+            "Metric": [
+                "PCAP File Analyzed",
+                "Total Packets Processed",
+                "Total Capture Duration",
+                "Suspected C2 Beacons",
+                "DNS Anomalies (DGA)",
+                "Cleartext Protocol Uses",
+                "Unique JA3 Fingerprints",
+                "Files Extracted"
+            ],
+            "Value": [
+                pcap_filename,
+                f"{len(df):,}",               # Adds commas to the number (e.g., 5,000,000)
+                str(capture_duration),
+                len(beacons),
+                len(dns_anomalies),
+                len(cleartext_df) if not cleartext_df.empty else 0,
+                len(ja3_stats),
+                len(carved_files_df)
+            ]
+        }
+        overview_df = pd.DataFrame(overview_data)
+        # We write this first so it becomes Tab #1
+        overview_df.to_excel(writer, sheet_name='📊 Executive Overview', index=False)
+        
+        
+        # --- INCIDENT SUMMARY TABS ---
         if not beacons.empty: beacons.to_excel(writer, sheet_name='🚨 Suspected Beacons', index=False)
         if not dns_anomalies.empty: dns_anomalies.to_excel(writer, sheet_name='🚨 DNS Anomalies', index=False)
         if not ja3_stats.empty: ja3_stats.to_excel(writer, sheet_name='🔍 JA3 TLS Fingerprints', index=False)
+        
+        # Endpoints Tab
+        if not cleartext_df.empty: 
+            cleartext_df.to_excel(writer, sheet_name='⚠️ Endpoints', index=False)
+        else:
+            pd.DataFrame({'Status': ['No insecure cleartext protocols detected.']}).to_excel(writer, sheet_name='⚠️ Endpoints', index=False)
         
         # Carved Files Tab
         if not carved_files_df.empty: 
@@ -177,17 +229,35 @@ def process_and_split_data(raw_dataframe, final_csv_path, summary_excel_path, ca
         else:
             pd.DataFrame({'Status': ['No HTTP/SMB files extracted.']}).to_excel(writer, sheet_name='📁 Extracted Files', index=False)
 
-        # Standard Network Context Tabs
-        if 'Src IP' in df.columns:
-            df['Src IP'].value_counts().reset_index(name='Packet Count').rename(columns={'Src IP': 'Source IP'}).to_excel(writer, sheet_name='Top Talkers', index=False)
-            if 'Dst IP' in df.columns:
-                df.groupby(['Src IP', 'Dst IP']).size().reset_index(name='Packet Count').sort_values('Packet Count', ascending=False).to_excel(writer, sheet_name='Top Conversations', index=False)
+
+        # --- FEATURE D: ADVANCED CONVERSATION STATS ---
+        if 'Src IP' in df.columns and 'Dst IP' in df.columns and 'ip.len' in df.columns:
+            # Group by conversation and run advanced math aggregations
+            conversations = df.groupby(['Src IP', 'Dst IP']).agg(
+                Packet_Count=('Src IP', 'count'),
+                Total_Bytes=('ip.len', 'sum'),
+                Start_Time=('Time', 'min'),
+                End_Time=('Time', 'max')
+            ).reset_index()
+            
+            # Calculate raw duration
+            raw_duration = conversations['End_Time'] - conversations['Start_Time']
+            
+            # Convert to Total Minutes (Great for sorting in Excel)
+            conversations['Duration (Mins)'] = (raw_duration.dt.total_seconds() / 60).round(2)
+            conversations['Total_KB'] = (conversations['Total_Bytes'] / 1024).round(2)
+            
+            # Clean up the column order for the presentation
+            cols = ['Src IP', 'Dst IP', 'Packet_Count', 'Total_KB', 'Duration (Mins)', 'Start_Time', 'End_Time']
+            conversations = conversations[cols].sort_values('Total_KB', ascending=False)
+            
+            conversations.to_excel(writer, sheet_name='Top Conversations', index=False)
                 
+        # Resolved Hosts Tab
         if 'Host' in df.columns:
             df.dropna(subset=['Host'])['Host'].value_counts().reset_index(name='Occurrence Count').rename(columns={'Host': 'Resolved Host / Domain'}).to_excel(writer, sheet_name='Resolved Hosts', index=False)
             
     print("[+] All reports generated successfully!")
-
 
 # --- MAIN EXECUTION W/ MULTIPROCESSING ---
 if __name__ == "__main__":
@@ -255,7 +325,7 @@ if __name__ == "__main__":
         df_list = [pd.read_csv(csv_file, names=tshark_fields, low_memory=False, on_bad_lines='skip') for csv_file in processed_csvs]
         master_df = pd.concat(df_list, ignore_index=True)
         
-        process_and_split_data(master_df, final_raw_csv, args.output, carved_files_df)
+        process_and_split_data(master_df, final_raw_csv, args.output, carved_files_df, input_pcap)
         
         # 4. Cleanup temporary files and chunk directories
         for csv_file in processed_csvs:
